@@ -23,6 +23,38 @@ docker compose up --build
 
 Если Redis недоступен, Backend продолжает работать с PostgreSQL. Если ML-сервис не отвечает за заданный таймаут, применяется детерминированный fallback-прогноз и в ответе указывается версия `fallback-v1`.
 
+## Обучение ML-модели и сабмит
+
+Offline-контур строит признаки строго из телеметрии с `event_time <= T`, обучает CatBoost-регрессию на задержку в секундах, проверяет её на размеченном `test` и затем дообучает финальную модель на `train + test`.
+
+```bash
+pip install -r ml/requirements.txt
+python -m ml.pipeline.train \
+  --data-dir "C:/path/to/dataset" \
+  --model-dir ml/models \
+  --submission ml/outputs/submission.csv
+```
+
+Команда сохраняет:
+
+- `ml/models/evaluation_metrics.json` — MAE модели и baselines на локальном test;
+- `ml/models/competition_delay_model.cbm` — финальную модель для validate;
+- `ml/models/competition_delay_model.metadata.json` — версию, признаки и параметры обучения;
+- `ml/outputs/submission.csv` — файл `sample_id;prediction`, готовый к загрузке.
+
+Повторно сформировать сабмит из сохранённой модели:
+
+```bash
+python -m ml.pipeline.submission \
+  --data-dir "C:/path/to/dataset" \
+  --model ml/models/competition_delay_model.cbm \
+  --output ml/outputs/submission.csv
+```
+
+Основные признаки: текущее отклонение и его динамика, плановый горизонт, циклическое время суток, положение целевой остановки, расстояние и направление к ней, возраст последней телеметрии, а также статистики скорости/остановок/движения за окна 1, 3, 5 и 10 минут. Будущая телеметрия и фактическое время целевой остановки в признаки не попадают.
+
+Текущий результат на локальном размеченном `test`: **MAE 53.09 сек**. Для сравнения, baseline `prediction = cur_dev_s` даёт **93.36 сек**, нулевой прогноз — **103.34 сек**. Метрика посчитана до дообучения финальной модели на `test`; поэтому test не использовался при получении этой оценки.
+
 ## Пример телеметрии
 
 ```bash

@@ -13,3 +13,4 @@ tmp/
 data/*.db
 *.db
 ml/models/*.cbm
+!ml/models/competition_delay_model.cbm

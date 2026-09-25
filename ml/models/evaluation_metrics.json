@@ -1,0 +1,8 @@
+{
+  "train_rows": 4434,
+  "test_rows": 353,
+  "mae_model_s": 53.089478168449794,
+  "mae_cur_dev_s": 93.35977337110482,
+  "mae_zero_s": 103.33711048158641,
+  "best_iteration": 898
+}
