@@ -162,11 +162,13 @@ async def ingest(point: TelematicsPoint, session: AsyncSession) -> IngestResult:
 @app.get(f"{PREFIX}/health")
 async def health(session: AsyncSession = Depends(get_session)) -> dict:
     database_ok = (await session.scalar(select(func.count(Route.id)))) is not None
+    ml_service_ok = await prediction_client.health()
     return {
-        "status": "ok" if database_ok else "degraded",
+        "status": "ok" if database_ok and ml_service_ok else "degraded",
         "database": database_ok,
         "redis": await cache.ping(),
         "ml_service": settings.ml_service_url,
+        "ml_service_ok": ml_service_ok,
     }
 
 
@@ -311,24 +313,27 @@ async def route_risk(route_id: int, session: AsyncSession = Depends(get_session)
 async def schedules(
     route_id: int | None = None, trip_id: str | None = None, session: AsyncSession = Depends(get_session)
 ) -> dict:
-    query = select(Schedule).order_by(Schedule.planned_arrival)
+    query = select(Schedule, Stop).join(Stop, Schedule.stop_id == Stop.id).order_by(Schedule.planned_arrival)
     if route_id:
         query = query.where(Schedule.route_id == route_id)
     if trip_id:
         query = query.where(Schedule.trip_id == trip_id)
-    rows = (await session.scalars(query)).all()
+    rows = (await session.execute(query)).all()
     return {
         "schedules": [
             {
-                "id": row.id,
-                "route_id": row.route_id,
-                "trip_id": row.trip_id,
-                "stop_id": row.stop_id,
-                "stop_sequence": row.stop_sequence,
-                "planned_arrival": row.planned_arrival,
-                "planned_departure": row.planned_departure,
+                "id": schedule.id,
+                "route_id": schedule.route_id,
+                "trip_id": schedule.trip_id,
+                "stop_id": schedule.stop_id,
+                "stop_name": stop.name,
+                "stop_lat": stop.lat,
+                "stop_lon": stop.lon,
+                "stop_sequence": schedule.stop_sequence,
+                "planned_arrival": schedule.planned_arrival,
+                "planned_departure": schedule.planned_departure,
             }
-            for row in rows
+            for schedule, stop in rows
         ],
         "total": len(rows),
     }
@@ -337,11 +342,26 @@ async def schedules(
 @app.get(f"{PREFIX}/stats")
 async def stats(session: AsyncSession = Depends(get_session)) -> dict:
     vehicle_count = await session.scalar(select(func.count(Vehicle.id))) or 0
-    high_risk = await session.scalar(select(func.count(Prediction.id)).where(Prediction.risk_level == "high")) or 0
+    latest_predictions = (
+        select(Prediction.vehicle_id, func.max(Prediction.predicted_at).label("predicted_at"))
+        .group_by(Prediction.vehicle_id)
+        .subquery()
+    )
+    current_predictions = select(Prediction).join(
+        latest_predictions,
+        (Prediction.vehicle_id == latest_predictions.c.vehicle_id)
+        & (Prediction.predicted_at == latest_predictions.c.predicted_at),
+    )
+    current_rows = (await session.scalars(current_predictions)).all()
+    high_risk = sum(row.risk_level == "high" for row in current_rows)
+    average_delay = (
+        sum(row.predicted_delay_min for row in current_rows) / len(current_rows) if current_rows else 0.0
+    )
     average_latency = await session.scalar(select(func.avg(Prediction.latency_ms))) or 0.0
     return {
         "vehicle_count": vehicle_count,
         "high_risk_predictions": high_risk,
+        "average_predicted_delay_min": round(float(average_delay), 2),
         "average_ml_latency_ms": round(float(average_latency), 2),
         "websocket_clients": len(hub.connections),
     }

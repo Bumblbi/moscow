@@ -6,28 +6,55 @@ from datetime import UTC, datetime
 import httpx
 
 
+ROUTE_POINTS = [
+    (55.7522, 37.6156),
+    (55.7577, 37.6159),
+    (55.7590, 37.6205),
+]
+VEHICLE_COUNT = 8
+
+
+def position(progress: float) -> tuple[float, float, int]:
+    scaled = progress * (len(ROUTE_POINTS) - 1)
+    segment = min(int(scaled), len(ROUTE_POINTS) - 2)
+    ratio = scaled - segment
+    start, end = ROUTE_POINTS[segment], ROUTE_POINTS[segment + 1]
+    lat = start[0] + (end[0] - start[0]) * ratio
+    lon = start[1] + (end[1] - start[1]) * ratio
+    nearest_stop = segment + 1 if ratio < 0.5 else segment + 2
+    return lat, lon, nearest_stop
+
+
 async def run(url: str, interval: float) -> None:
     sequence = 0
     async with httpx.AsyncClient(timeout=5) as client:
         while True:
             sequence += 1
-            payload = {
-                "vehicle_id": "BUS-100",
-                "route_id": 1,
-                "trip_id": "M2-001",
-                "timestamp": datetime.now(UTC).isoformat(),
-                "lat": 55.7522 + sequence * 0.0002,
-                "lon": 37.6156 + sequence * 0.0002,
-                "speed": round(random.uniform(5, 30), 1),
-                "heading": 80,
-                "nearest_stop_id": min(3, 1 + sequence // 10),
-                "door_status": "open" if sequence % 12 == 0 else "closed",
-            }
-            try:
-                response = await client.post(url, json=payload)
-                print(response.status_code, response.text, flush=True)
-            except httpx.HTTPError as exc:
-                print(f"stream retry: {exc}", flush=True)
+            for index in range(VEHICLE_COUNT):
+                progress = (sequence * 0.012 + index / VEHICLE_COUNT) % 1.0
+                lat, lon, nearest_stop = position(progress)
+                slow_vehicle = index in {1, 5}
+                stopped = index == 3 and sequence % 8 in {0, 1}
+                speed = random.uniform(3, 9) if slow_vehicle else random.uniform(17, 31)
+                if stopped:
+                    speed = 0.0
+                payload = {
+                    "vehicle_id": f"BUS-{100 + index}",
+                    "route_id": 1,
+                    "trip_id": "M2-001",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "speed": round(speed, 1),
+                    "heading": 80 if progress < 0.5 else 65,
+                    "nearest_stop_id": nearest_stop,
+                    "door_status": "open" if stopped else "closed",
+                }
+                try:
+                    response = await client.post(url, json=payload)
+                    print(response.status_code, payload["vehicle_id"], flush=True)
+                except httpx.HTTPError as exc:
+                    print(f"stream retry: {exc}", flush=True)
             await asyncio.sleep(interval)
 
 

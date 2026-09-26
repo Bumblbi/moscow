@@ -77,6 +77,14 @@ class PredictionClient:
             parsed = fallback_prediction(features)
         return PredictionResult(parsed, (time.perf_counter() - started) * 1000)
 
+    async def health(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.ml_timeout_seconds) as client:
+                response = await client.get(f"{self.settings.ml_service_url.rstrip('/')}/health")
+                response.raise_for_status()
+            return True
+        except httpx.HTTPError:
+            return False
 
 class Cache:
     def __init__(self, url: str):
