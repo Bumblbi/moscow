@@ -24,7 +24,10 @@ services:
   ml-service:
     build: ./ml
     environment:
-      MODEL_PATH: /app/models/delay_model.cbm
+      MODEL_PATH: /app/models/competition_delay_model.cbm
+      MODEL_METADATA_PATH: /app/models/competition_delay_model.metadata.json
+    ports:
+      - "8001:8001"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 10s
@@ -39,8 +42,12 @@ services:
       DATABASE_URL: postgresql+asyncpg://transport:transport@postgres:5432/transport
       REDIS_URL: redis://redis:6379/0
       ML_SERVICE_URL: http://ml-service:8001
+      NDTP_ENABLED: "true"
+      NDTP_HOST: 0.0.0.0
+      NDTP_PORT: "9201"
     ports:
       - "8000:8000"
+      - "9201:9201"
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,7 +60,7 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "3000:80"
+      - "8080:80"
     depends_on:
       backend:
         condition: service_started

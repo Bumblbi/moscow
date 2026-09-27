@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-runtime.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements-runtime.txt \
+    && pip install --no-deps catboost==1.2.7
 COPY app ./app
 COPY models ./models
 EXPOSE 8001

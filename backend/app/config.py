@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     prediction_horizon_min: int = Field(default=15, ge=10, le=15)
     delay_threshold_min: float = 3.0
     seed_demo_data: bool = True
+    ndtp_enabled: bool = False
+    ndtp_host: str = "0.0.0.0"
+    ndtp_port: int = Field(default=9201, ge=1, le=65535)
+    ndtp_route_id: int = Field(default=1, gt=0)
+    ndtp_trip_id: str = "M2-001"
 
 
 @lru_cache

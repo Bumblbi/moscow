@@ -38,6 +38,7 @@ const emptyStats: Stats = {
   average_predicted_delay_min: 0,
   average_ml_latency_ms: 0,
   websocket_clients: 0,
+  ndtp_packets_processed: 0,
 }
 
 const formatClock = (date: Date) => new Intl.DateTimeFormat('ru-RU', {
@@ -352,6 +353,7 @@ function MonitoringView({ health, stats, connected }: { health: Health | null; s
     { name: 'Redis', detail: 'Кэш состояний ТС', ok: health?.redis ?? false, value: '120 sec' },
     { name: 'ML Service', detail: 'Контур прогнозирования', ok: health?.ml_service_ok ?? false, value: `${stats.average_ml_latency_ms.toFixed(0)} ms` },
     { name: 'WebSocket', detail: 'Поток обновлений', ok: connected, value: `${stats.websocket_clients} clients` },
+    { name: 'NDTP listener', detail: 'Бинарная телеметрия эмулятора', ok: health?.ndtp_listener ?? false, value: `${stats.ndtp_packets_processed} packets` },
   ]
   const allOnline = services.every((service) => service.ok)
 

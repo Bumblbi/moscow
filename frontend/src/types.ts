@@ -42,6 +42,7 @@ export interface Stats {
   average_predicted_delay_min: number
   average_ml_latency_ms: number
   websocket_clients: number
+  ndtp_packets_processed: number
 }
 
 export interface Health {
@@ -50,6 +51,7 @@ export interface Health {
   redis: boolean
   ml_service: string
   ml_service_ok: boolean
+  ndtp_listener: boolean
 }
 
 export interface HistoryPoint {

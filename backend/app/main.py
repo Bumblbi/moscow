@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -10,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from .config import get_settings
 from .database import SessionLocal, create_schema, get_session
 from .models import Prediction, Route, Schedule, Stop, TelematicsHistory, Vehicle
+from .ndtp import NPL_HEADER, decode_frame
 from .schemas import IngestResult, PredictionOut, TelematicsBatch, TelematicsPoint, VehicleOut
 from .services import (
     Cache,
@@ -49,6 +51,50 @@ class SocketHub:
 
 
 hub = SocketHub()
+ndtp_server: asyncio.AbstractServer | None = None
+ndtp_packets_processed = 0
+
+
+async def nearest_stop_id(session: AsyncSession, lat: float, lon: float) -> int | None:
+    stops = (await session.scalars(select(Stop))).all()
+    if not stops:
+        return None
+    return min(stops, key=lambda stop: (stop.lat - lat) ** 2 + (stop.lon - lon) ** 2).id
+
+
+async def handle_ndtp(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    global ndtp_packets_processed
+    try:
+        while True:
+            npl = await reader.readexactly(NPL_HEADER.size)
+            data_size = NPL_HEADER.unpack(npl)[1]
+            if data_size > 65535:
+                break
+            navigation = decode_frame(npl, await reader.readexactly(data_size))
+            if navigation is None or not navigation.location_valid:
+                continue
+            async with SessionLocal() as session:
+                stop_id = await nearest_stop_id(session, navigation.lat, navigation.lon)
+                await ingest(
+                    TelematicsPoint(
+                        vehicle_id=f"NDTP-{navigation.unit_id}",
+                        route_id=settings.ndtp_route_id,
+                        trip_id=settings.ndtp_trip_id,
+                        timestamp=navigation.timestamp,
+                        lat=navigation.lat,
+                        lon=navigation.lon,
+                        speed=navigation.speed,
+                        heading=navigation.heading,
+                        nearest_stop_id=stop_id,
+                    ),
+                    session,
+                )
+                ndtp_packets_processed += 1
+    except (asyncio.IncompleteReadError, ConnectionError, ValueError):
+        pass
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
 async def seed_demo() -> None:
@@ -81,10 +127,16 @@ async def seed_demo() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global ndtp_server
     await create_schema()
     if settings.seed_demo_data:
         await seed_demo()
+    if settings.ndtp_enabled:
+        ndtp_server = await asyncio.start_server(handle_ndtp, settings.ndtp_host, settings.ndtp_port)
     yield
+    if ndtp_server:
+        ndtp_server.close()
+        await ndtp_server.wait_closed()
     await cache.close()
 
 
@@ -169,6 +221,7 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict:
         "redis": await cache.ping(),
         "ml_service": settings.ml_service_url,
         "ml_service_ok": ml_service_ok,
+        "ndtp_listener": bool(ndtp_server and ndtp_server.is_serving()),
     }
 
 
@@ -364,6 +417,7 @@ async def stats(session: AsyncSession = Depends(get_session)) -> dict:
         "average_predicted_delay_min": round(float(average_delay), 2),
         "average_ml_latency_ms": round(float(average_latency), 2),
         "websocket_clients": len(hub.connections),
+        "ndtp_packets_processed": ndtp_packets_processed,
     }
 
 

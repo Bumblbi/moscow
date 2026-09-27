@@ -68,10 +68,11 @@ class MLPredictionRequest(BaseModel):
     historical_delay_min: float
     dwell_seconds: float = 0.0
     horizon_min: int = Field(ge=10, le=15)
+    model_features: dict[str, float | None] | None = None
 
 
 class MLPredictionResponse(BaseModel):
     probability: float = Field(ge=0, le=1)
-    predicted_delay_min: float = Field(ge=0)
+    predicted_delay_min: float
     reason: str
     model_version: str

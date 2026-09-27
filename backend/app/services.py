@@ -2,15 +2,16 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, timedelta
+from statistics import pstdev
 
 import httpx
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings
-from .models import Prediction, Schedule, Vehicle
+from .models import Prediction, Schedule, Stop, TelematicsHistory, Vehicle
 from .schemas import MLPredictionRequest, MLPredictionResponse, TelematicsPoint, VehicleOut
 
 
@@ -82,8 +83,9 @@ class PredictionClient:
             async with httpx.AsyncClient(timeout=self.settings.ml_timeout_seconds) as client:
                 response = await client.get(f"{self.settings.ml_service_url.rstrip('/')}/health")
                 response.raise_for_status()
-            return True
-        except httpx.HTTPError:
+                payload = response.json()
+            return bool(payload.get("model_loaded"))
+        except (httpx.HTTPError, ValueError):
             return False
 
 class Cache:
@@ -129,8 +131,15 @@ async def calculate_delay(session: AsyncSession, point: TelematicsPoint) -> floa
 
 
 async def historical_delay(session: AsyncSession, vehicle_id: str) -> float:
-    value = await session.scalar(select(func.avg(Vehicle.current_delay_min)).where(Vehicle.id == vehicle_id))
-    return float(value or 0.0)
+    values = (
+        await session.scalars(
+            select(Prediction.predicted_delay_min)
+            .where(Prediction.vehicle_id == vehicle_id)
+            .order_by(Prediction.predicted_at.desc())
+            .limit(20)
+        )
+    ).all()
+    return float(sum(values) / len(values)) if values else 0.0
 
 
 async def latest_prediction(session: AsyncSession, vehicle_id: str) -> Prediction | None:
@@ -160,13 +169,113 @@ def vehicle_output(vehicle: Vehicle, prediction: Prediction | None) -> VehicleOu
 async def build_features(
     session: AsyncSession, point: TelematicsPoint, delay: float, horizon: int
 ) -> MLPredictionRequest:
-    dwell = 180.0 if point.door_status == "open" and point.speed < 1 else 0.0
+    def aware(value):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+    history = (
+        await session.scalars(
+            select(TelematicsHistory)
+            .where(
+                TelematicsHistory.vehicle_id == point.vehicle_id,
+                TelematicsHistory.timestamp <= point.timestamp,
+                TelematicsHistory.timestamp >= point.timestamp - timedelta(minutes=15),
+            )
+            .order_by(TelematicsHistory.timestamp)
+        )
+    ).all()
+    target = (
+        await session.execute(
+            select(Schedule, Stop)
+            .join(Stop, Stop.id == Schedule.stop_id)
+            .where(
+                Schedule.route_id == point.route_id,
+                Schedule.trip_id == point.trip_id,
+                Schedule.planned_arrival >= point.timestamp + timedelta(minutes=10),
+                Schedule.planned_arrival <= point.timestamp + timedelta(minutes=15),
+            )
+            .order_by(Schedule.planned_arrival)
+            .limit(1)
+        )
+    ).first()
+    if target is None and point.nearest_stop_id:
+        target = (
+            await session.execute(
+                select(Schedule, Stop)
+                .join(Stop, Stop.id == Schedule.stop_id)
+                .where(
+                    Schedule.route_id == point.route_id,
+                    Schedule.trip_id == point.trip_id,
+                    Schedule.stop_id == point.nearest_stop_id,
+                )
+                .limit(1)
+            )
+        ).first()
+    target_schedule, target_stop = target if target else (None, None)
+    target_lat = target_stop.lat if target_stop else point.lat
+    target_lon = target_stop.lon if target_stop else point.lon
+    distance = haversine_km(point.lat, point.lon, target_lat, target_lon)
+    dwell = 0.0
+    for row in reversed(history):
+        if row.speed >= 1 or row.door_status != "open":
+            break
+        dwell = max(0.0, (point.timestamp - aware(row.timestamp)).total_seconds())
+
+    seconds_of_day = point.timestamp.hour * 3600 + point.timestamp.minute * 60 + point.timestamp.second
+    phase = 2 * math.pi * seconds_of_day / 86400
+    model_features: dict[str, float | None] = {
+        "cur_dev_s": delay * 60,
+        "horizon_s": (
+            (target_schedule.planned_arrival.replace(tzinfo=UTC) - point.timestamp).total_seconds()
+            if target_schedule and target_schedule.planned_arrival.tzinfo is None
+            else (target_schedule.planned_arrival - point.timestamp).total_seconds()
+            if target_schedule
+            else horizon * 60
+        ),
+        "hour_sin": math.sin(phase),
+        "hour_cos": math.cos(phase),
+        "weekday": float(point.timestamp.weekday()),
+        "target_lon": target_lon,
+        "target_lat": target_lat,
+        "manual_fill": 0.0,
+        "last_lon": point.lon,
+        "last_lat": point.lat,
+        "last_speed": point.speed,
+        "last_heading": point.heading,
+        "telemetry_age_s": 0.0,
+        "distance_to_target_km": distance,
+        "cur_dev_mean_15m": delay * 60,
+        "cur_dev_std_15m": 0.0,
+    }
+    if point.heading is not None and distance > 0:
+        lat1, lat2 = math.radians(point.lat), math.radians(target_lat)
+        delta_lon = math.radians(target_lon - point.lon)
+        bearing = (math.degrees(math.atan2(math.sin(delta_lon) * math.cos(lat2), math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(delta_lon))) + 360) % 360
+        model_features["heading_error_deg"] = abs((point.heading - bearing + 180) % 360 - 180)
+
+    for minutes in (1, 3, 5, 10):
+        start = point.timestamp - timedelta(minutes=minutes)
+        rows = [row for row in history if aware(row.timestamp) >= start]
+        speeds = [float(row.speed) for row in rows]
+        prefix = f"_{minutes}m"
+        model_features[f"telemetry_count{prefix}"] = float(len(rows))
+        model_features[f"valid_ratio{prefix}"] = 1.0 if rows else 0.0
+        if speeds:
+            model_features[f"speed_mean{prefix}"] = sum(speeds) / len(speeds)
+            model_features[f"speed_std{prefix}"] = pstdev(speeds) if len(speeds) > 1 else 0.0
+            model_features[f"speed_min{prefix}"] = min(speeds)
+            model_features[f"speed_max{prefix}"] = max(speeds)
+            model_features[f"speed_delta{prefix}"] = speeds[-1] - speeds[0]
+            model_features[f"stationary_ratio{prefix}"] = sum(speed < 1 for speed in speeds) / len(speeds)
+            model_features[f"movement_km{prefix}"] = sum(
+                haversine_km(a.lat, a.lon, b.lat, b.lon) for a, b in zip(rows, rows[1:])
+            )
     return MLPredictionRequest(
         current_delay_min=delay,
         speed=point.speed,
-        distance_to_stop_km=0.0,
+        distance_to_stop_km=distance,
         hour=point.timestamp.hour,
         historical_delay_min=await historical_delay(session, point.vehicle_id),
         dwell_seconds=dwell,
         horizon_min=horizon,
+        model_features=model_features,
     )

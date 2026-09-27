@@ -1,5 +1,6 @@
 import math
 import os
+import json
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -19,14 +20,24 @@ class Features(BaseModel):
     historical_delay_min: float
     dwell_seconds: float = 0.0
     horizon_min: int = Field(ge=10, le=15)
+    model_features: dict[str, float | None] | None = None
 
 
 app = FastAPI(title="Transport predictor ML service", version="1.0.0")
 model_path = Path(os.getenv("MODEL_PATH", "models/delay_model.cbm"))
+metadata_path = Path(os.getenv("MODEL_METADATA_PATH", "models/competition_delay_model.metadata.json"))
 model = None
+feature_columns: list[str] = []
+model_version = "baseline-v1"
 if CatBoostRegressor and model_path.exists():
     model = CatBoostRegressor()
     model.load_model(model_path)
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        feature_columns = list(metadata.get("feature_columns", []))
+        model_version = str(metadata.get("model_version", "catboost-v1"))
+    elif model.feature_names_:
+        feature_columns = list(model.feature_names_)
 
 
 def heuristic(features: Features) -> tuple[float, float, str]:
@@ -53,28 +64,21 @@ def health() -> dict:
     return {
         "status": "ok",
         "model_loaded": model is not None,
-        "model_version": "catboost-v1" if model else "baseline-v1",
+        "model_version": model_version,
+        "feature_count": len(feature_columns),
     }
 
 
 @app.post("/predict")
 def predict(features: Features) -> dict:
-    if model:
-        row = [
-            [
-                features.current_delay_min,
-                features.speed,
-                features.distance_to_stop_km,
-                features.hour,
-                features.historical_delay_min,
-                features.dwell_seconds,
-                features.horizon_min,
-            ]
-        ]
-        delay = max(0.0, float(model.predict(row)[0]))
-        probability = 1 / (1 + math.exp(-(delay - 3.0)))
+    if model and feature_columns:
+        supplied = features.model_features or {}
+        row = [[float(supplied[name]) if supplied.get(name) is not None else math.nan for name in feature_columns]]
+        delay_seconds = float(model.predict(row)[0])
+        delay = delay_seconds / 60.0
+        probability = 1 / (1 + math.exp(-((delay_seconds - 180.0) / 60.0)))
         reason = "паттерн CatBoost"
-        version = "catboost-v1"
+        version = model_version
     else:
         probability, delay, reason = heuristic(features)
         version = "baseline-v1"
